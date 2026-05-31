@@ -6,6 +6,7 @@ coverage.json
 .env
 .env.local
 deployments
+shared
 typechain-types
 *.log
 .DS_Store
