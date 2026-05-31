@@ -74,6 +74,7 @@ contract Marketplace is Ownable, ReentrancyGuard {
     error UnexpectedETH();
     error NothingToWithdraw();
     error TransferFailed();
+    error NoDirectTransfers();
 
     constructor(address weth_) Ownable(msg.sender) {
         weth = weth_;
@@ -226,5 +227,33 @@ contract Marketplace is Ownable, ReentrancyGuard {
     function _sendETH(address to, uint256 amount) internal {
         (bool ok, ) = payable(to).call{value: amount}("");
         if (!ok) revert TransferFailed();
+    }
+
+    // --- reject direct asset transfers (enforces the no-escrow model) -------
+
+    function onERC721Received(address, address, uint256, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        revert NoDirectTransfers();
+    }
+
+    function onERC1155Received(address, address, uint256, uint256, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        revert NoDirectTransfers();
+    }
+
+    function onERC1155BatchReceived(
+        address,
+        address,
+        uint256[] calldata,
+        uint256[] calldata,
+        bytes calldata
+    ) external pure returns (bytes4) {
+        revert NoDirectTransfers();
     }
 }
