@@ -5,6 +5,8 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title Onchain NFT Marketplace
 /// @notice No-escrow marketplace for ERC-721 and ERC-1155 assets. Sellers
@@ -15,6 +17,8 @@ import {IERC1155} from "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 /// @dev    `price` is the TOTAL price for the listed `amount` of an ERC-1155
 ///         sale (ERC-721 sales always list a single token).
 contract Marketplace is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     /// @notice Marketplace fee in basis points (0.55%).
     uint256 public constant FEE_BPS = 55;
     uint256 internal constant BPS_DENOMINATOR = 10_000;
@@ -34,6 +38,9 @@ contract Marketplace is Ownable, ReentrancyGuard {
     mapping(address => mapping(uint256 => mapping(address => Sale))) public erc721Sales;
     mapping(address => mapping(uint256 => mapping(address => Sale))) public erc1155Sales;
 
+    /// @notice Fees collected per payment currency (address(0) == ETH).
+    mapping(address => uint256) public accruedFees;
+
     event SaleListed(
         bool indexed isERC1155,
         address indexed nft,
@@ -45,10 +52,28 @@ contract Marketplace is Ownable, ReentrancyGuard {
         bool updated
     );
 
+    event Purchase(
+        bool indexed isERC1155,
+        address indexed nft,
+        uint256 id,
+        address seller,
+        address indexed buyer,
+        uint256 amount,
+        uint256 price,
+        address paidIn
+    );
+
+    event FeeWithdrawn(address indexed token, address indexed to, uint256 amount);
+
     error ZeroAmount();
     error ZeroPrice();
     error NotAssetOwner();
     error InsufficientBalance();
+    error SaleNotFound();
+    error InsufficientPayment();
+    error UnexpectedETH();
+    error NothingToWithdraw();
+    error TransferFailed();
 
     constructor(address weth_) Ownable(msg.sender) {
         weth = weth_;
@@ -111,5 +136,95 @@ contract Marketplace is Ownable, ReentrancyGuard {
         });
 
         emit SaleListed(false, nft, id, msg.sender, 1, price, paymentToken, updated);
+    }
+
+    // --- buying -------------------------------------------------------------
+
+    /// @notice Buy an ERC-721 asset listed by `seller`. Pays the seller and
+    ///         transfers the token to the buyer.
+    function buyERC721(address nft, uint256 id, address seller)
+        external
+        payable
+        nonReentrant
+    {
+        Sale memory sale = erc721Sales[nft][id][seller];
+        if (!sale.active) revert SaleNotFound();
+        delete erc721Sales[nft][id][seller];
+
+        _settle(sale.paymentToken, sale.price, sale.seller);
+        IERC721(nft).safeTransferFrom(sale.seller, msg.sender, id);
+
+        emit Purchase(false, nft, id, sale.seller, msg.sender, 1, sale.price, _paidIn(sale.paymentToken));
+    }
+
+    /// @notice Buy the full listed amount of an ERC-1155 asset from `seller`.
+    function buyERC1155(address nft, uint256 id, address seller)
+        external
+        payable
+        nonReentrant
+    {
+        Sale memory sale = erc1155Sales[nft][id][seller];
+        if (!sale.active) revert SaleNotFound();
+        delete erc1155Sales[nft][id][seller];
+
+        _settle(sale.paymentToken, sale.price, sale.seller);
+        IERC1155(nft).safeTransferFrom(sale.seller, msg.sender, id, sale.amount, "");
+
+        emit Purchase(true, nft, id, sale.seller, msg.sender, sale.amount, sale.price, _paidIn(sale.paymentToken));
+    }
+
+    // --- payment + fees -----------------------------------------------------
+
+    /// @dev Routes payment from the buyer to the seller, takes the fee, and
+    ///      supports paying an ETH sale in WETH (and a WETH sale in ETH).
+    function _settle(address paymentToken, uint256 price, address seller) internal {
+        uint256 fee = (price * FEE_BPS) / BPS_DENOMINATOR;
+        uint256 proceeds = price - fee;
+        bool ethClass = paymentToken == address(0) || paymentToken == weth;
+
+        if (ethClass && msg.value > 0) {
+            // pay in native ETH
+            if (msg.value < price) revert InsufficientPayment();
+            accruedFees[address(0)] += fee;
+            _sendETH(seller, proceeds);
+            if (msg.value > price) _sendETH(msg.sender, msg.value - price);
+        } else if (ethClass) {
+            // pay an ETH/WETH sale in WETH
+            IERC20(weth).safeTransferFrom(msg.sender, seller, proceeds);
+            if (fee > 0) IERC20(weth).safeTransferFrom(msg.sender, address(this), fee);
+            accruedFees[weth] += fee;
+        } else {
+            // plain ERC-20 sale
+            if (msg.value != 0) revert UnexpectedETH();
+            IERC20(paymentToken).safeTransferFrom(msg.sender, seller, proceeds);
+            if (fee > 0) IERC20(paymentToken).safeTransferFrom(msg.sender, address(this), fee);
+            accruedFees[paymentToken] += fee;
+        }
+    }
+
+    /// @notice Withdraw collected fees for a given currency (address(0) == ETH).
+    function withdrawFees(address token) external onlyOwner nonReentrant {
+        uint256 amount = accruedFees[token];
+        if (amount == 0) revert NothingToWithdraw();
+        accruedFees[token] = 0;
+
+        if (token == address(0)) {
+            _sendETH(owner(), amount);
+        } else {
+            IERC20(token).safeTransfer(owner(), amount);
+        }
+        emit FeeWithdrawn(token, owner(), amount);
+    }
+
+    /// @dev Currency the buyer actually paid in, for the Purchase event.
+    function _paidIn(address paymentToken) internal view returns (address) {
+        bool ethClass = paymentToken == address(0) || paymentToken == weth;
+        if (ethClass) return msg.value > 0 ? address(0) : weth;
+        return paymentToken;
+    }
+
+    function _sendETH(address to, uint256 amount) internal {
+        (bool ok, ) = payable(to).call{value: amount}("");
+        if (!ok) revert TransferFailed();
     }
 }
